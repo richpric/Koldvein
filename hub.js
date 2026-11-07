@@ -261,6 +261,7 @@ function resolveMethodFile(fileName) {
   } catch (e) {
     return { exists: false, path: p, error: e.message };
   }
+  /* case-insensitive fallback */
   try {
     const dir = fs.readdirSync(SCRIPT_DIR);
     const lower = fileName.toLowerCase();
@@ -417,25 +418,6 @@ const slaves = initSlaves({
 });
 
 const backup = initBackup({ DATA_DIR: CONFIG.dataDir });
-
-/* ---------- attack log notify ---------- */
-function notifyAttack(payload) {
-  if (!process.env.BOT_NOTIFY_SECRET) return;
-  const body = JSON.stringify(Object.assign({ kind: 'attack', at: new Date().toISOString() }, payload || {}));
-  const req = http.request({
-    host: process.env.BOT_NOTIFY_HOST || '127.0.0.1',
-    port: Number(process.env.BOT_NOTIFY_PORT || 3099),
-    path: '/internal/notify', method: 'POST', timeout: 4000,
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-      'X-Notify-Secret': process.env.BOT_NOTIFY_SECRET,
-    },
-  }, r => r.resume());
-  req.on('timeout', () => { try { req.destroy(); } catch {} });
-  req.on('error', () => {});
-  req.end(body);
-}
 
 let paymentsModule = null;
 if (paymentsInit) {
@@ -987,16 +969,6 @@ app.post('/api/sessions', auth, async (req, res) => {
         audit('process_started', user.username, {
           id, method: method.id, target: t.host, duration: d, rate: r,
           threads, slaveId: slave.id, batchId,
-        });
-        notifyAttack({
-          user: user.username,
-          target: t.url,
-          method: method.id,
-          methodName: method.name,
-          duration: d,
-          rate: r,
-          sessionId: id,
-          batchId,
         });
       } catch (e) {
         sessionObj.status = 'failed';
@@ -1661,6 +1633,7 @@ async function loadMethods(){
     });
 
     if(!anyAvailable){
+      /* no available methods: show them all but select nothing, warn */
       opts.unshift('<option value="">— no method files found on hub —</option>');
     }
 
@@ -1684,6 +1657,7 @@ async function loadMethods(){
     updateMethodFields();
   }catch(e){
     console.error('[loadMethods] failed:', e);
+    /* fall back: leave whatever the server-rendered HTML had, but hint at the error */
     if(hint)hint.textContent='Could not load methods: ' + e.message;
     showToast('Method load failed: ' + e.message);
   }
@@ -2480,8 +2454,7 @@ async function boot() {
     const list = slaves.listSlaves();
     console.log('  slaves ready : ' + list.filter(s => s.status === 'ready').length + '/' + list.length);
     console.log('  total threads: ' + slaves.totalThreads());
-    console.log('  backup       : running (2-min, keep 30)');
-    console.log('  attack log   : ' + (process.env.BOT_NOTIFY_SECRET ? 'notify -> bot' : 'disabled (no BOT_NOTIFY_SECRET)') + '\n');
+    console.log('  backup       : running (2-min, keep 30)\n');
   });
 
   function shutdown(sig) {
