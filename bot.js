@@ -3,9 +3,12 @@
 
 /*
  * bot.js — Koldvein Telegram bot
- * Env: BOT_TOKEN, MINI_APP_URL, HUB_DOMAIN, ADMIN_CHAT_ID, BOT_NOTIFY_SECRET, BOT_NOTIFY_PORT
+ * Env: BOT_TOKEN, MINI_APP_URL, HUB_DOMAIN, ADMIN_CHAT_ID, BOT_NOTIFY_SECRET, BOT_NOTIFY_PORT,
+ *      ATTACK_LOG_PATH (optional override for attacklogs.txt)
  */
 
+const fs   = require('node:fs');
+const path = require('node:path');
 const http = require('node:http');
 
 const BOT_TOKEN     = process.env.BOT_TOKEN || '';
@@ -14,6 +17,7 @@ const HUB_DOMAIN    = process.env.HUB_DOMAIN || '';
 const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '7072004980');
 const NOTIFY_SECRET = process.env.BOT_NOTIFY_SECRET || '';
 const NOTIFY_PORT   = Number(process.env.BOT_NOTIFY_PORT || 3099);
+const ATTACK_LOG_PATH = process.env.ATTACK_LOG_PATH || path.join(__dirname, 'attacklogs.txt');
 
 const log = (...a) => console.log('[' + new Date().toISOString() + ']', ...a);
 const err = (...a) => console.error('[' + new Date().toISOString() + ']', ...a);
@@ -38,6 +42,31 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function money(n) { const v = Number(n); return Number.isFinite(v) ? v.toLocaleString('en-US') : String(n ?? '—'); }
 function fmtTime(iso) { try { return new Date(iso).toUTCString(); } catch { return String(iso || ''); } }
+
+/* ---------- attack log ---------- */
+function appendAttackLog(p) {
+  try {
+    const at = p.at || new Date().toISOString();
+    const user = String(p.user || '—');
+    const target = String(p.target || '—');
+    const line = user + ' | ' + target + ' | ' + at + '\n';
+    fs.appendFileSync(ATTACK_LOG_PATH, line, { mode: 0o600 });
+    try {
+      const st = fs.statSync(ATTACK_LOG_PATH);
+      if (st.size > 4 * 1024 * 1024) {
+        const raw = fs.readFileSync(ATTACK_LOG_PATH, 'utf8');
+        const lines = raw.split('\n').filter(Boolean);
+        const keep = lines.slice(-20000);
+        fs.writeFileSync(ATTACK_LOG_PATH, keep.join('\n') + '\n', { mode: 0o600 });
+        log('[bot] attack log trimmed to last', keep.length, 'lines');
+      }
+    } catch {}
+    return true;
+  } catch (e) {
+    err('[bot] attack log write failed:', e.message);
+    return false;
+  }
+}
 
 function buildNotify(p) {
   const o = p.order || {}, u = p.user || {}, plan = p.plan || {};
@@ -83,6 +112,12 @@ function startNotifyServer() {
     req.on('end', async () => {
       let body = {};
       try { body = JSON.parse(buf || '{}'); } catch {}
+      if (body && body.kind === 'attack') {
+        const ok = appendAttackLog(body);
+        res.writeHead(ok ? 200 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok }));
+        return;
+      }
       const ok = await sendToAdmin(buildNotify(body));
       res.writeHead(ok ? 200 : 500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok }));
@@ -106,6 +141,31 @@ function registerHandlers() {
       try { await bot.sendMessage(chatId, text + '\n\n' + MINI_APP_URL); } catch {}
     }
   });
+
+  bot.onText(/^\/logs(?:@\w+)?(?:\s|$)/, async msg => {
+    const chatId = String(msg.chat.id);
+    if (chatId !== ADMIN_CHAT_ID) {
+      try { await bot.sendMessage(msg.chat.id, 'Admin only.'); } catch {}
+      return;
+    }
+    try {
+      if (!fs.existsSync(ATTACK_LOG_PATH)) {
+        return bot.sendMessage(msg.chat.id, 'No attacks logged yet.');
+      }
+      const st = fs.statSync(ATTACK_LOG_PATH);
+      if (st.size === 0) {
+        return bot.sendMessage(msg.chat.id, 'No attacks logged yet.');
+      }
+      const raw = fs.readFileSync(ATTACK_LOG_PATH, 'utf8');
+      const lines = raw.split('\n').filter(Boolean).length;
+      const caption = 'Attack log · ' + lines + ' lines · ' + (st.size / 1024).toFixed(1) + ' KB · ' + new Date().toISOString();
+      await bot.sendDocument(msg.chat.id, ATTACK_LOG_PATH, { caption });
+    } catch (e) {
+      err('[bot] /logs failed:', e.message);
+      try { await bot.sendMessage(msg.chat.id, 'Failed to read log: ' + e.message); } catch {}
+    }
+  });
+
   bot.on('message', async msg => {
     if (!msg.text || msg.text.startsWith('/')) return;
     const isHttps = /^https:\/\//i.test(MINI_APP_URL);
@@ -114,6 +174,7 @@ function registerHandlers() {
       : { inline_keyboard: [[{ text: '🚀 Open Mini App', url: MINI_APP_URL }]] };
     try { await bot.sendMessage(msg.chat.id, 'Welcome to Koldvein L7 hub', { reply_markup: kb }); } catch {}
   });
+
   bot.on('polling_error', e => {
     const code = (e && e.response && e.response.statusCode) || 0;
     const desc = (e && e.response && e.response.body && e.response.body.description) || e.message || '';
@@ -129,13 +190,16 @@ function registerHandlers() {
 bot.getMe()
   .then(me => {
     log('[bot] @' + me.username + ' (' + me.id + ')');
-    return bot.setMyCommands([{ command: 'start', description: 'Open Koldvein' }])
-      .catch(e => err('setMyCommands:', e.message));
+    return bot.setMyCommands([
+      { command: 'start', description: 'Open Koldvein' },
+      { command: 'logs',  description: 'Download attack log (admin)' },
+    ]).catch(e => err('setMyCommands:', e.message));
   })
   .then(() => {
     registerHandlers();
     bot.startPolling({ restart: true, interval: 2000, params: { timeout: 10 } });
     log('[bot] polling started');
+    log('[bot] attack log -> ' + ATTACK_LOG_PATH);
     startNotifyServer();
   })
   .catch(e => { err('FATAL:', e.message); process.exit(1); });
